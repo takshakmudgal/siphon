@@ -6,8 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::app::{
-    AUTO_INTERVALS_SECS, App, AutoForm, ConfirmKind, ConnForm, Dialog, Focus, RunningDump,
-    ToastKind,
+    AUTO_INTERVALS_SECS, App, AutoForm, BackupDirNext, BackupDirPrompt, ConfirmKind, ConnForm,
+    Dialog, Focus, ToastKind,
 };
 use crate::backup::{self, BackupOutcome};
 use crate::config::Config;
@@ -125,14 +125,21 @@ async fn handle_main_key(app: &mut App, key: KeyEvent, ctx: &Ctx) {
                         // Stable id derived from container so re-detect keeps it.
                         c.id = format!("docker-{}", d.container_id.chars().take(12).collect::<String>());
                         let mut cfg = ctx.config.lock().await;
-                        cfg.upsert(c);
-                        if let Err(e) = cfg.save() {
-                            app.toast(format!("save failed: {e}"), ToastKind::Error);
+                        if let Some(dupe) = cfg.duplicate_of(&c, Some(&c.id)) {
+                            app.toast(
+                                format!("already saved as '{}'", dupe),
+                                ToastKind::Info,
+                            );
                         } else {
-                            app.toast(format!("imported {}", d.display_name()), ToastKind::Success);
+                            cfg.upsert(c);
+                            if let Err(e) = cfg.save() {
+                                app.toast(format!("save failed: {e}"), ToastKind::Error);
+                            } else {
+                                app.toast(format!("imported {}", d.display_name()), ToastKind::Success);
+                            }
+                            drop(cfg);
+                            refresh_cache(app, ctx).await;
                         }
-                        drop(cfg);
-                        refresh_cache(app, ctx).await;
                     }
                     Err(e) => app.toast(e, ToastKind::Error),
                 }
@@ -141,13 +148,21 @@ async fn handle_main_key(app: &mut App, key: KeyEvent, ctx: &Ctx) {
 
         (KeyCode::Char('d'), _) | (KeyCode::Enter, _) => {
             if let Some(c) = app.current_saved().cloned() {
-                app.dialog = Some(Dialog::Confirm(ConfirmKind::Dump {
-                    conn_id: c.id.clone(),
-                    name: c.name.clone(),
-                }));
+                if app.is_dumping(&c.id) {
+                    app.toast(format!("already dumping {}", c.name), ToastKind::Info);
+                } else {
+                    app.dialog = Some(Dialog::Confirm(ConfirmKind::Dump {
+                        conn_id: c.id.clone(),
+                        name: c.name.clone(),
+                    }));
+                }
             } else if let Some(d) = app.current_detected().cloned() {
                 let conn = transient_from_detected(&d);
-                spawn_dump(ctx, app, conn);
+                if app.is_dumping(&conn.id) {
+                    app.toast(format!("already dumping {}", conn.name), ToastKind::Info);
+                } else if let Some(root) = resolve_dir_or_prompt(app, ctx, &conn).await {
+                    spawn_dump(ctx, app, conn, root);
+                }
             }
         }
 
@@ -195,22 +210,36 @@ async fn handle_dialog_key(app: &mut App, key: KeyEvent, ctx: &Ctx) {
                     match form.validate() {
                         Ok(conn) => {
                             let mut cfg = ctx.config.lock().await;
-                            let was_edit = form.editing_id.is_some();
-                            cfg.upsert(conn.clone());
-                            if let Err(e) = cfg.save() {
-                                app.toast(format!("save failed: {e}"), ToastKind::Error);
+                            let editing = form.editing_id.clone();
+                            if let Some(dupe) =
+                                cfg.duplicate_of(&conn, editing.as_deref())
+                            {
+                                drop(cfg);
+                                if let Dialog::Form(form) = &mut dialog {
+                                    form.error = Some(format!(
+                                        "duplicate — already saved as '{}'",
+                                        dupe
+                                    ));
+                                }
                                 app.dialog = Some(dialog);
                             } else {
-                                app.toast(
-                                    format!(
-                                        "{} {}",
-                                        if was_edit { "updated" } else { "added" },
-                                        conn.name
-                                    ),
-                                    ToastKind::Success,
-                                );
-                                drop(cfg);
-                                refresh_cache(app, ctx).await;
+                                let was_edit = editing.is_some();
+                                cfg.upsert(conn.clone());
+                                if let Err(e) = cfg.save() {
+                                    app.toast(format!("save failed: {e}"), ToastKind::Error);
+                                    app.dialog = Some(dialog);
+                                } else {
+                                    app.toast(
+                                        format!(
+                                            "{} {}",
+                                            if was_edit { "updated" } else { "added" },
+                                            conn.name
+                                        ),
+                                        ToastKind::Success,
+                                    );
+                                    drop(cfg);
+                                    refresh_cache(app, ctx).await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -282,7 +311,9 @@ async fn handle_dialog_key(app: &mut App, key: KeyEvent, ctx: &Ctx) {
                             cfg.connections.iter().find(|c| c.id == conn_id).cloned()
                         };
                         if let Some(conn) = conn {
-                            spawn_dump(ctx, app, conn);
+                            if let Some(root) = resolve_dir_or_prompt(app, ctx, &conn).await {
+                                spawn_dump(ctx, app, conn, root);
+                            }
                         }
                     }
                 }
@@ -293,12 +324,54 @@ async fn handle_dialog_key(app: &mut App, key: KeyEvent, ctx: &Ctx) {
             }
         },
 
-        Dialog::Progress { .. } => match key.code {
-            KeyCode::Esc => {
-                // Keep the task running but dismiss the modal.
-            }
-            _ => {
+        Dialog::BackupDir(prompt) => match handle_dir_prompt_key(prompt, key) {
+            FormOutcome::Continue => {
                 app.dialog = Some(dialog);
+            }
+            FormOutcome::Cancel => {}
+            FormOutcome::Save => {
+                if let Dialog::BackupDir(prompt) = &dialog {
+                    let raw = prompt.path.trim();
+                    if raw.is_empty() {
+                        if let Dialog::BackupDir(p) = &mut dialog {
+                            p.error = Some("path is required (esc to cancel)".into());
+                        }
+                        app.dialog = Some(dialog);
+                    } else {
+                        let resolved = expand_path(raw);
+                        if let Err(e) = std::fs::create_dir_all(&resolved) {
+                            if let Dialog::BackupDir(p) = &mut dialog {
+                                p.error = Some(format!("cannot create: {e}"));
+                            }
+                            app.dialog = Some(dialog);
+                        } else {
+                            let kind = prompt.kind;
+                            let next = prompt.next.clone();
+                            let mut cfg = ctx.config.lock().await;
+                            cfg.set_dir_for_kind(kind, resolved.clone());
+                            if let Err(e) = cfg.save() {
+                                app.toast(format!("save failed: {e}"), ToastKind::Error);
+                            } else {
+                                app.toast(
+                                    format!("postgres → {}", resolved.display())
+                                        .replacen("postgres", kind.label(), 1),
+                                    ToastKind::Success,
+                                );
+                            }
+                            let conn_after = match next {
+                                BackupDirNext::Dump { conn_id } => cfg
+                                    .connections
+                                    .iter()
+                                    .find(|c| c.id == conn_id)
+                                    .cloned(),
+                            };
+                            drop(cfg);
+                            if let Some(c) = conn_after {
+                                spawn_dump(ctx, app, c, resolved);
+                            }
+                        }
+                    }
+                }
             }
         },
 
@@ -365,6 +438,39 @@ fn handle_form_key(form: &mut ConnForm, key: KeyEvent) -> FormOutcome {
     FormOutcome::Continue
 }
 
+fn handle_dir_prompt_key(prompt: &mut BackupDirPrompt, key: KeyEvent) -> FormOutcome {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => FormOutcome::Cancel,
+        (KeyCode::Enter, _) => FormOutcome::Save,
+        (KeyCode::Backspace, _) => {
+            prompt.path.pop();
+            FormOutcome::Continue
+        }
+        (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
+            prompt.path.clear();
+            FormOutcome::Continue
+        }
+        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+            prompt.path.push(c);
+            FormOutcome::Continue
+        }
+        _ => FormOutcome::Continue,
+    }
+}
+
+fn expand_path(raw: &str) -> std::path::PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if raw == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    std::path::PathBuf::from(raw)
+}
+
 fn handle_auto_key(form: &mut AutoForm, key: KeyEvent) -> FormOutcome {
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => return FormOutcome::Cancel,
@@ -391,22 +497,27 @@ fn handle_auto_key(form: &mut AutoForm, key: KeyEvent) -> FormOutcome {
 }
 
 pub async fn refresh_cache(app: &mut App, ctx: &Ctx) {
-    let snapshot = ctx.config.lock().await.connections.clone();
-    app.conn_cache = snapshot;
+    let cfg = ctx.config.lock().await;
+    app.conn_cache = cfg.connections.clone();
+    app.kind_dirs_cache = cfg
+        .backup_dirs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    drop(cfg);
     app.clamp_selection();
 }
 
-fn spawn_dump(ctx: &Ctx, app: &mut App, conn: Connection) {
-    app.dialog = Some(Dialog::Progress {
-        label: format!("dumping {}…", conn.name),
-    });
-    app.running = Some(RunningDump {
-        conn_id: conn.id.clone(),
-        name: conn.name.clone(),
-        started: std::time::Instant::now(),
-    });
+/// Kick off a background dump for `conn` against `root`. Non-blocking — the
+/// UI stays responsive and the user can start more dumps on other connections.
+fn spawn_dump(ctx: &Ctx, app: &mut App, conn: Connection, root: std::path::PathBuf) {
+    if app.is_dumping(&conn.id) {
+        app.toast(format!("already dumping {}", conn.name), ToastKind::Info);
+        return;
+    }
+    app.add_running(conn.id.clone(), conn.name.clone());
+    app.toast(format!("dumping {}…", conn.name), ToastKind::Info);
     let tx = ctx.tx.clone();
-    let root = ctx.backup_root.clone();
     let _ = tx.send(AppEvent::DumpStarted {
         conn_id: conn.id.clone(),
         name: conn.name.clone(),
@@ -430,6 +541,33 @@ fn spawn_dump(ctx: &Ctx, app: &mut App, conn: Connection) {
             }
         }
     });
+}
+
+/// Resolve the backup dir for the connection's kind, or prompt the user for one
+/// (first time per kind). Returns Some(path) if the dump can proceed
+/// immediately, None if a prompt was opened instead.
+async fn resolve_dir_or_prompt(
+    app: &mut App,
+    ctx: &Ctx,
+    conn: &Connection,
+) -> Option<std::path::PathBuf> {
+    let cfg = ctx.config.lock().await;
+    if cfg.has_dir_for_kind(conn.kind) {
+        let dir = cfg.dir_for_kind(conn.kind);
+        std::fs::create_dir_all(&dir).ok();
+        return Some(dir);
+    }
+    let default = cfg.dir_for_kind(conn.kind);
+    drop(cfg);
+    app.dialog = Some(Dialog::BackupDir(BackupDirPrompt {
+        kind: conn.kind,
+        next: BackupDirNext::Dump {
+            conn_id: conn.id.clone(),
+        },
+        path: default.to_string_lossy().to_string(),
+        error: None,
+    }));
+    None
 }
 
 pub fn spawn_detect(tx: mpsc::UnboundedSender<AppEvent>, app: &mut App) {
@@ -505,12 +643,12 @@ pub async fn apply_event(app: &mut App, ev: AppEvent, ctx: &Ctx) {
             if let Some(keep) = keep_opt {
                 let cfg = ctx.config.lock().await;
                 if let Some(c) = cfg.connections.iter().find(|c| c.id == conn_id).cloned() {
+                    let dir = cfg.dir_for_kind(c.kind);
                     drop(cfg);
-                    let _ = backup::prune(&ctx.backup_root, &c, keep);
+                    let _ = backup::prune(&dir, &c, keep);
                 }
             }
-            app.dialog = None;
-            app.running = None;
+            app.finish_running(&conn_id);
             app.toast(
                 format!(
                     "✓ {} · {} in {}",
@@ -522,9 +660,8 @@ pub async fn apply_event(app: &mut App, ev: AppEvent, ctx: &Ctx) {
             );
             refresh_cache(app, ctx).await;
         }
-        AppEvent::DumpFailed { name, error, .. } => {
-            app.dialog = None;
-            app.running = None;
+        AppEvent::DumpFailed { conn_id, name, error } => {
+            app.finish_running(&conn_id);
             let short = error.lines().next().unwrap_or(&error).chars().take(120).collect::<String>();
             app.toast(format!("✗ {name}: {short}"), ToastKind::Error);
         }

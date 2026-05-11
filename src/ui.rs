@@ -42,7 +42,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Dialog::Form(form) => draw_form(f, form),
             Dialog::Auto(form) => draw_auto(f, form, app),
             Dialog::Confirm(kind) => draw_confirm(f, kind),
-            Dialog::Progress { label } => draw_progress(f, label),
+            Dialog::BackupDir(prompt) => draw_dir_prompt(f, prompt),
             Dialog::Help => draw_help(f),
         }
     }
@@ -158,7 +158,8 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     let saved_section_offset = items.len();
     for (i, c) in app.conn_cache.iter().enumerate() {
         let selected = app.sel.kind == SelKind::Saved && app.sel.index == i;
-        items.push(connection_row(c, selected, focused));
+        let busy = app.is_dumping(&c.id);
+        items.push(connection_row(c, selected, focused, busy));
         if selected {
             state_idx = items.len() - 1;
         }
@@ -212,7 +213,12 @@ fn section_header(title: &str) -> ListItem<'_> {
     ]))
 }
 
-fn connection_row<'a>(c: &'a Connection, selected: bool, focused: bool) -> ListItem<'a> {
+fn connection_row<'a>(
+    c: &'a Connection,
+    selected: bool,
+    focused: bool,
+    busy: bool,
+) -> ListItem<'a> {
     let chevron = if selected { "▸ " } else { "  " };
     let cstyle = chevron_style(selected, focused);
     let kind_lbl = format!("[{}]", c.kind.label());
@@ -231,7 +237,7 @@ fn connection_row<'a>(c: &'a Connection, selected: bool, focused: bool) -> ListI
         }
         _ => String::new(),
     };
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(chevron, cstyle),
         Span::styled(
             c.name.clone(),
@@ -245,7 +251,14 @@ fn connection_row<'a>(c: &'a Connection, selected: bool, focused: bool) -> ListI
         ),
         Span::raw("  "),
         Span::styled(kind_lbl, Style::default().fg(ACCENT)),
-    ]);
+    ];
+    if busy {
+        title_spans.push(Span::styled(
+            "  ↻ dumping",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let title = Line::from(title_spans);
     let sub = Line::from(vec![
         Span::raw("  "),
         Span::styled(location, Style::default().fg(FG_DIM)),
@@ -406,17 +419,14 @@ fn draw_saved_details(
         Span::styled(runtime_hint.0, Style::default().fg(runtime_hint.1)),
     ]));
 
-    if app.running.as_ref().map(|r| r.conn_id.as_str()) == Some(c.id.as_str()) {
+    if let Some(r) = app.running.iter().find(|r| r.conn_id == c.id) {
         lines.push(Line::from(vec![
             Span::styled(
                 "  • dumping…  ",
                 Style::default().fg(WARN).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
-                    "{}s",
-                    app.running.as_ref().unwrap().started.elapsed().as_secs()
-                ),
+                format!("{}s", r.started.elapsed().as_secs()),
                 Style::default().fg(FG_DIM),
             ),
         ]));
@@ -509,7 +519,7 @@ fn kv(k: &str, v: &str) -> Line<'static> {
 }
 
 fn draw_backup_list(f: &mut Frame, area: Rect, c: &Connection, app: &App) {
-    let files = backup::list(&app.backup_root, c);
+    let files = backup::list(&app.dir_for_kind(c.kind), c);
     let header = Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -592,7 +602,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     push(&mut spans, "q", "quit");
     f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
-    if let Some(t) = &app.toast {
+    // Status line: toast if present, otherwise summary of running dumps.
+    let status_line = if let Some(t) = &app.toast {
         let color = match t.kind {
             ToastKind::Info => FG_MUTED,
             ToastKind::Success => SUCCESS,
@@ -603,16 +614,34 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ToastKind::Success => "✓",
             ToastKind::Error => "✗",
         };
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" {prefix} "),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(t.message.clone(), Style::default().fg(color)),
-            ])),
-            rows[1],
-        );
+        Some(Line::from(vec![
+            Span::styled(
+                format!(" {prefix} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(t.message.clone(), Style::default().fg(color)),
+        ]))
+    } else if !app.running.is_empty() {
+        let mut spans = vec![Span::styled(
+            " ↻ dumping  ",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )];
+        for (i, r) in app.running.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", Style::default().fg(FG_DIM)));
+            }
+            spans.push(Span::styled(r.name.clone(), Style::default().fg(FG_BRIGHT)));
+            spans.push(Span::styled(
+                format!(" ({}s)", r.started.elapsed().as_secs()),
+                Style::default().fg(FG_DIM),
+            ));
+        }
+        Some(Line::from(spans))
+    } else {
+        None
+    };
+    if let Some(line) = status_line {
+        f.render_widget(Paragraph::new(line), rows[1]);
     }
 }
 
@@ -851,27 +880,58 @@ fn draw_confirm(f: &mut Frame, kind: &ConfirmKind) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_progress(f: &mut Frame, label: &str) {
-    let area = centered_rect(50, 5, f.area());
+fn draw_dir_prompt(f: &mut Frame, prompt: &crate::app::BackupDirPrompt) {
+    let area = centered_rect(70, 10, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(WARN))
+        .border_style(Style::default().fg(ACCENT))
         .title(Line::from(Span::styled(
-            " working ",
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            format!(" backup folder · {} ", prompt.kind.label()),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let body = Paragraph::new(vec![
-        Line::raw(""),
+
+    let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
-            format!("  {}", label),
+            format!(
+                "first {} backup — where should it (and future ones) go?",
+                prompt.kind.label()
+            ),
             Style::default().fg(FG_BRIGHT),
         )),
-    ]);
-    f.render_widget(body, inner);
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("path  ", Style::default().fg(FG_DIM)),
+            Span::styled(
+                prompt.path.clone(),
+                Style::default().fg(FG_BRIGHT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("│", Style::default().fg(ACCENT)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  this choice is remembered per DB kind. edit ~/.siphon/config.toml to change later.",
+            Style::default().fg(FG_DIM),
+        )),
+    ];
+    if let Some(err) = &prompt.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ! {err}"),
+            Style::default().fg(ERROR),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        key("enter"), sep(" save & dump   "),
+        key("ctrl-u"), sep(" clear   "),
+        key("esc"), sep(" cancel dump"),
+    ]));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_help(f: &mut Frame) {

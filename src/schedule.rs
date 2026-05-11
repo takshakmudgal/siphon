@@ -53,12 +53,10 @@ impl Scheduler {
 
     /// Walk the config and run any backup that's due.
     pub async fn run_once(&self) {
-        let (root, due) = {
+        let due: Vec<(Connection, std::path::PathBuf)> = {
             let cfg = self.config.lock().await;
-            let Ok(root) = cfg.effective_backup_dir() else { return };
             let now = Utc::now().timestamp();
-            let due: Vec<Connection> = cfg
-                .connections
+            cfg.connections
                 .iter()
                 .filter(|c| match &c.auto_backup {
                     Some(ab) if ab.enabled => {
@@ -67,13 +65,20 @@ impl Scheduler {
                     }
                     _ => false,
                 })
-                .cloned()
-                .collect();
-            (root, due)
+                .map(|c| (c.clone(), cfg.dir_for_kind(c.kind)))
+                .collect()
         };
 
-        for conn in due {
-            self.run_one(&root, conn).await;
+        // Fan out — scheduled dumps run concurrently across distinct DBs.
+        let mut handles = Vec::new();
+        for (conn, dir) in due {
+            let me = self.clone();
+            handles.push(tokio::spawn(async move {
+                me.run_one(&dir, conn).await;
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
         }
     }
 

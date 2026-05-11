@@ -347,11 +347,26 @@ pub enum ConfirmKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct BackupDirPrompt {
+    pub kind: crate::types::DbKind,
+    /// Pending action once the user confirms.
+    pub next: BackupDirNext,
+    pub path: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BackupDirNext {
+    /// Run a one-shot dump for this connection after the path is saved.
+    Dump { conn_id: String },
+}
+
+#[derive(Debug, Clone)]
 pub enum Dialog {
     Form(ConnForm),
     Auto(AutoForm),
     Confirm(ConfirmKind),
-    Progress { label: String },
+    BackupDir(BackupDirPrompt),
     Help,
 }
 
@@ -372,10 +387,14 @@ pub struct App {
     pub dialog: Option<Dialog>,
     pub toast: Option<Toast>,
     pub scanning_detect: bool,
-    pub running: Option<RunningDump>,
+    /// All dumps currently in flight. Multiple connections can dump concurrently;
+    /// the same connection cannot.
+    pub running: Vec<RunningDump>,
     pub last_detect_at: Option<Instant>,
     /// Cached snapshot of `config.connections` for synchronous UI access. Refreshed on every loop tick.
     pub conn_cache: Vec<Connection>,
+    /// Cached snapshot of per-kind backup directories.
+    pub kind_dirs_cache: std::collections::HashMap<String, std::path::PathBuf>,
 }
 
 impl App {
@@ -393,10 +412,36 @@ impl App {
             dialog: None,
             toast: None,
             scanning_detect: true,
-            running: None,
+            running: Vec::new(),
             last_detect_at: None,
             conn_cache: Vec::new(),
+            kind_dirs_cache: std::collections::HashMap::new(),
         }
+    }
+
+    pub fn dir_for_kind(&self, kind: crate::types::DbKind) -> std::path::PathBuf {
+        if let Some(p) = self.kind_dirs_cache.get(kind.config_key()) {
+            return p.clone();
+        }
+        self.backup_root.join(kind.config_key())
+    }
+
+    pub fn is_dumping(&self, conn_id: &str) -> bool {
+        self.running.iter().any(|r| r.conn_id == conn_id)
+    }
+
+    pub fn add_running(&mut self, conn_id: String, name: String) {
+        if !self.is_dumping(&conn_id) {
+            self.running.push(RunningDump {
+                conn_id,
+                name,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    pub fn finish_running(&mut self, conn_id: &str) {
+        self.running.retain(|r| r.conn_id != conn_id);
     }
 
     pub fn toast(&mut self, msg: impl Into<String>, kind: ToastKind) {
@@ -609,6 +654,23 @@ mod tests {
         assert!(f.build().is_err());
         f.retention = "5".into();
         assert_eq!(f.build().unwrap().retention, 5);
+    }
+
+    #[test]
+    fn running_dumps_track_per_connection() {
+        let mut app = app_with(vec![pg_conn("1", "a"), pg_conn("2", "b")], vec![]);
+        assert!(!app.is_dumping("1"));
+        app.add_running("1".into(), "a".into());
+        assert!(app.is_dumping("1"));
+        assert!(!app.is_dumping("2"));
+        // Idempotent: adding the same id again doesn't create a second slot.
+        app.add_running("1".into(), "a".into());
+        assert_eq!(app.running.len(), 1);
+        app.add_running("2".into(), "b".into());
+        assert_eq!(app.running.len(), 2);
+        app.finish_running("1");
+        assert!(!app.is_dumping("1"));
+        assert!(app.is_dumping("2"));
     }
 
     #[test]

@@ -53,6 +53,27 @@ impl DbKind {
         }
     }
 
+    pub fn config_key(self) -> &'static str {
+        match self {
+            DbKind::Postgres => "postgres",
+            DbKind::Mongo => "mongo",
+            DbKind::Mysql => "mysql",
+            DbKind::Sqlite => "sqlite",
+            DbKind::Redis => "redis",
+        }
+    }
+
+    pub fn from_config_key(s: &str) -> Option<DbKind> {
+        match s {
+            "postgres" => Some(DbKind::Postgres),
+            "mongo" => Some(DbKind::Mongo),
+            "mysql" => Some(DbKind::Mysql),
+            "sqlite" => Some(DbKind::Sqlite),
+            "redis" => Some(DbKind::Redis),
+            _ => None,
+        }
+    }
+
     pub fn from_image(image: &str) -> Option<DbKind> {
         let lower = image.to_lowercase();
         let bare = lower.rsplit('/').next().unwrap_or(&lower);
@@ -106,6 +127,51 @@ pub struct Connection {
     /// Last successful dump timestamp (epoch seconds).
     #[serde(default)]
     pub last_backup_at: Option<i64>,
+}
+
+impl Connection {
+    /// Stable identity for the *underlying* database, used to reject duplicate
+    /// saved connections. Two configs that point at the same DB return equal
+    /// fingerprints regardless of cosmetic differences (name casing,
+    /// container_id presence, etc.).
+    pub fn fingerprint(&self) -> String {
+        if self.kind == DbKind::Sqlite {
+            let p = self
+                .database
+                .as_deref()
+                .or(self.uri.as_deref())
+                .unwrap_or("");
+            let canon = std::path::PathBuf::from(p)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| p.to_string());
+            return format!("sqlite:{canon}");
+        }
+        if let Some(uri) = self.uri.as_deref().filter(|s| !s.is_empty()) {
+            if let Ok(u) = url::Url::parse(uri) {
+                let host = u.host_str().unwrap_or("").to_lowercase();
+                let port = u.port().unwrap_or(self.kind.default_port());
+                let db = u.path().trim_start_matches('/').to_lowercase();
+                return format!("{}:{}:{}:{}", self.kind.config_key(), host, port, db);
+            }
+        }
+        let host = if self.host.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            self.host.to_lowercase()
+        };
+        let port = if self.port == 0 {
+            self.kind.default_port()
+        } else {
+            self.port
+        };
+        let db = self
+            .database
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase();
+        format!("{}:{}:{}:{}", self.kind.config_key(), host, port, db)
+    }
 }
 
 impl Default for DbKind {
@@ -242,6 +308,83 @@ mod tests {
         assert_eq!(human_bytes(2048), "2.0 KB");
         assert!(human_bytes(2_500_000).ends_with("MB"));
         assert!(human_bytes(3_000_000_000).ends_with("GB"));
+    }
+
+    #[test]
+    fn fingerprint_equal_for_same_db() {
+        let a = Connection {
+            kind: DbKind::Postgres,
+            host: "DB.example.com".into(),
+            port: 5432,
+            database: Some("prod".into()),
+            ..Default::default()
+        };
+        let b = Connection {
+            kind: DbKind::Postgres,
+            host: "db.example.com".into(),
+            port: 5432,
+            database: Some("PROD".into()),
+            // different cosmetic fields:
+            name: "different name".into(),
+            user: Some("ignored".into()),
+            ..Default::default()
+        };
+        assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_differs_when_db_differs() {
+        let a = Connection {
+            kind: DbKind::Postgres,
+            host: "db.example.com".into(),
+            port: 5432,
+            database: Some("prod".into()),
+            ..Default::default()
+        };
+        let b = Connection {
+            kind: DbKind::Postgres,
+            host: "db.example.com".into(),
+            port: 5432,
+            database: Some("staging".into()),
+            ..Default::default()
+        };
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_uri_mode_matches_field_mode_for_same_db() {
+        let by_fields = Connection {
+            kind: DbKind::Postgres,
+            host: "db.example.com".into(),
+            port: 5432,
+            database: Some("prod".into()),
+            ..Default::default()
+        };
+        let by_uri = Connection {
+            kind: DbKind::Postgres,
+            uri: Some("postgres://x:y@db.example.com:5432/prod".into()),
+            ..Default::default()
+        };
+        assert_eq!(by_fields.fingerprint(), by_uri.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_kind_changes_value() {
+        let pg = Connection {
+            kind: DbKind::Postgres,
+            host: "h".into(),
+            port: 5432,
+            database: Some("d".into()),
+            ..Default::default()
+        };
+        let my = Connection {
+            kind: DbKind::Mysql,
+            host: "h".into(),
+            port: 5432,
+            database: Some("d".into()),
+            ..Default::default()
+        };
+        assert_ne!(pg.fingerprint(), my.fingerprint());
     }
 
     #[test]
