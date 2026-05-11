@@ -43,6 +43,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Dialog::Auto(form) => draw_auto(f, form, app),
             Dialog::Confirm(kind) => draw_confirm(f, kind),
             Dialog::BackupDir(prompt) => draw_dir_prompt(f, prompt),
+            Dialog::RestorePicker(p) => draw_restore_picker(f, p),
             Dialog::Help => draw_help(f),
         }
     }
@@ -158,7 +159,11 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     let saved_section_offset = items.len();
     for (i, c) in app.conn_cache.iter().enumerate() {
         let selected = app.sel.kind == SelKind::Saved && app.sel.index == i;
-        let busy = app.is_dumping(&c.id);
+        let busy = app
+            .running
+            .iter()
+            .find(|r| r.conn_id == c.id)
+            .map(|r| r.kind.verb());
         items.push(connection_row(c, selected, focused, busy));
         if selected {
             state_idx = items.len() - 1;
@@ -217,7 +222,7 @@ fn connection_row<'a>(
     c: &'a Connection,
     selected: bool,
     focused: bool,
-    busy: bool,
+    busy: Option<&'a str>,
 ) -> ListItem<'a> {
     let chevron = if selected { "▸ " } else { "  " };
     let cstyle = chevron_style(selected, focused);
@@ -252,9 +257,9 @@ fn connection_row<'a>(
         Span::raw("  "),
         Span::styled(kind_lbl, Style::default().fg(ACCENT)),
     ];
-    if busy {
+    if let Some(verb) = busy {
         title_spans.push(Span::styled(
-            "  ↻ dumping",
+            format!("  ↻ {verb}"),
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         ));
     }
@@ -591,13 +596,13 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     };
     push(&mut spans, "n", "new");
     push(&mut spans, "d", "dump");
+    push(&mut spans, "R", "restore");
     push(&mut spans, "a", "auto");
     push(&mut spans, "t", "test");
     push(&mut spans, "i", "import");
     push(&mut spans, "e", "edit");
     push(&mut spans, "D", "delete");
     push(&mut spans, "r", "rescan");
-    push(&mut spans, "o", "open dir");
     push(&mut spans, "?", "help");
     push(&mut spans, "q", "quit");
     f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
@@ -623,13 +628,18 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         ]))
     } else if !app.running.is_empty() {
         let mut spans = vec![Span::styled(
-            " ↻ dumping  ",
+            " ↻ ",
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         )];
         for (i, r) in app.running.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::styled(" · ", Style::default().fg(FG_DIM)));
+                spans.push(Span::styled("  ·  ", Style::default().fg(FG_DIM)));
             }
+            spans.push(Span::styled(
+                r.kind.verb(),
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
             spans.push(Span::styled(r.name.clone(), Style::default().fg(FG_BRIGHT)));
             spans.push(Span::styled(
                 format!(" ({}s)", r.started.elapsed().as_secs()),
@@ -854,9 +864,29 @@ fn draw_confirm(f: &mut Frame, kind: &ConfirmKind) {
             ))],
             ACCENT,
         ),
+        ConfirmKind::Restore { name, path, .. } => {
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("dump");
+            (
+                " restore — OVERWRITES DATA ",
+                vec![
+                    Line::from(Span::styled(
+                        format!("restore '{}' from {}?", name, file_name),
+                        Style::default().fg(FG_BRIGHT),
+                    )),
+                    Line::from(Span::styled(
+                        "this writes to the database. existing rows in dumped tables will be replaced.",
+                        Style::default().fg(ERROR),
+                    )),
+                ],
+                ERROR,
+            )
+        }
     };
 
-    let area = centered_rect(50, 7, f.area());
+    let area = centered_rect(60, 8, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -878,6 +908,95 @@ fn draw_confirm(f: &mut Frame, kind: &ConfirmKind) {
         Span::styled(" cancel", Style::default().fg(FG_MUTED)),
     ]));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_restore_picker(f: &mut Frame, picker: &crate::app::RestorePicker) {
+    let height = (picker.files.len().min(12) as u16 + 6).max(10);
+    let area = centered_rect(80, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(WARN))
+        .title(Line::from(Span::styled(
+            format!(" restore → {} ", picker.name),
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  pick a dump  ", Style::default().fg(FG_DIM)),
+            Span::styled(
+                format!("({} on disk, newest first)", picker.files.len()),
+                Style::default().fg(FG_DIM),
+            ),
+        ])),
+        split[0],
+    );
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(picker.files.len());
+    for (i, f) in picker.files.iter().enumerate() {
+        let selected = i == picker.idx;
+        let chevron = if selected { "▸ " } else { "  " };
+        let chevron_style = if selected {
+            Style::default().fg(WARN)
+        } else {
+            Style::default().fg(BORDER_DIM)
+        };
+        let name = f
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?");
+        let when = chrono::Utc
+            .timestamp_opt(f.created_at, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "?".into());
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(chevron, chevron_style),
+            Span::styled(
+                name.to_string(),
+                Style::default()
+                    .fg(if selected { FG_BRIGHT } else { FG_MUTED })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                format!("  {}  ", human_bytes(f.bytes)),
+                Style::default().fg(FG_DIM),
+            ),
+            Span::styled(when, Style::default().fg(FG_DIM)),
+        ])));
+    }
+    let mut state = ListState::default();
+    state.select(Some(picker.idx));
+    let list = List::new(items).highlight_style(Style::default().bg(HL_BG));
+    f.render_stateful_widget(list, split[1], &mut state);
+
+    let hint = Line::from(vec![
+        key("↑↓"),
+        sep(" select   "),
+        key("enter"),
+        sep(" restore (asks to confirm)   "),
+        key("esc"),
+        sep(" cancel"),
+    ]);
+    f.render_widget(Paragraph::new(hint), split[2]);
 }
 
 fn draw_dir_prompt(f: &mut Frame, prompt: &crate::app::BackupDirPrompt) {
@@ -969,6 +1088,7 @@ fn draw_help(f: &mut Frame) {
         )),
         row("n", "new connection (form)"),
         row("d / enter", "dump selected db now"),
+        row("R", "restore a dump back into the selected db"),
         row("a", "configure auto-backup"),
         row("t", "test connection"),
         row("i", "import detected docker db"),

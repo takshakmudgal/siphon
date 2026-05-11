@@ -7,11 +7,12 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::app::{
     AUTO_INTERVALS_SECS, App, AutoForm, BackupDirNext, BackupDirPrompt, ConfirmKind, ConnForm,
-    Dialog, Focus, ToastKind,
+    Dialog, Focus, OpKind, RestorePicker, ToastKind,
 };
 use crate::backup::{self, BackupOutcome};
 use crate::config::Config;
 use crate::detect;
+use crate::restore::{self, RestoreOutcome};
 use crate::types::{Connection, DbKind, DetectedSource};
 
 /// Messages emitted by background tasks back to the main loop.
@@ -25,6 +26,21 @@ pub enum AppEvent {
         outcome: BackupOutcome,
     },
     DumpFailed {
+        conn_id: String,
+        name: String,
+        error: String,
+    },
+    RestoreStarted {
+        conn_id: String,
+        name: String,
+    },
+    RestoreSucceeded {
+        conn_id: String,
+        name: String,
+        outcome: RestoreOutcome,
+        path: std::path::PathBuf,
+    },
+    RestoreFailed {
         conn_id: String,
         name: String,
         error: String,
@@ -143,6 +159,35 @@ async fn handle_main_key(app: &mut App, key: KeyEvent, ctx: &Ctx) {
                     }
                     Err(e) => app.toast(e, ToastKind::Error),
                 }
+            } else if app.current_saved().is_some() {
+                app.toast(
+                    "import is for Detected entries — scroll down to one (or press R to restore a dump)",
+                    ToastKind::Info,
+                );
+            } else {
+                app.toast("nothing selected", ToastKind::Info);
+            }
+        }
+
+        (KeyCode::Char('R'), _) => {
+            if let Some(c) = app.current_saved().cloned() {
+                let dir = app.dir_for_kind(c.kind);
+                let files = backup::list(&dir, &c);
+                if files.is_empty() {
+                    app.toast(
+                        format!("no dumps to restore for {} — press d to make one first", c.name),
+                        ToastKind::Info,
+                    );
+                } else {
+                    app.dialog = Some(Dialog::RestorePicker(RestorePicker {
+                        conn_id: c.id.clone(),
+                        name: c.name.clone(),
+                        files,
+                        idx: 0,
+                    }));
+                }
+            } else {
+                app.toast("select a saved connection to restore into", ToastKind::Info);
             }
         }
 
@@ -316,6 +361,15 @@ async fn handle_dialog_key(app: &mut App, key: KeyEvent, ctx: &Ctx) {
                             }
                         }
                     }
+                    ConfirmKind::Restore { conn_id, path, .. } => {
+                        let conn = {
+                            let cfg = ctx.config.lock().await;
+                            cfg.connections.iter().find(|c| c.id == conn_id).cloned()
+                        };
+                        if let Some(conn) = conn {
+                            spawn_restore(ctx, app, conn, path);
+                        }
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {}
@@ -372,6 +426,35 @@ async fn handle_dialog_key(app: &mut App, key: KeyEvent, ctx: &Ctx) {
                         }
                     }
                 }
+            }
+        },
+
+        Dialog::RestorePicker(picker) => match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {}
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                if picker.idx > 0 {
+                    picker.idx -= 1;
+                }
+                app.dialog = Some(dialog);
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                if picker.idx + 1 < picker.files.len() {
+                    picker.idx += 1;
+                }
+                app.dialog = Some(dialog);
+            }
+            (KeyCode::Enter, _) => {
+                let chosen = picker.files.get(picker.idx).cloned();
+                if let Some(file) = chosen {
+                    app.dialog = Some(Dialog::Confirm(ConfirmKind::Restore {
+                        conn_id: picker.conn_id.clone(),
+                        name: picker.name.clone(),
+                        path: file.path,
+                    }));
+                }
+            }
+            _ => {
+                app.dialog = Some(dialog);
             }
         },
 
@@ -515,7 +598,7 @@ fn spawn_dump(ctx: &Ctx, app: &mut App, conn: Connection, root: std::path::PathB
         app.toast(format!("already dumping {}", conn.name), ToastKind::Info);
         return;
     }
-    app.add_running(conn.id.clone(), conn.name.clone());
+    app.add_running(conn.id.clone(), conn.name.clone(), OpKind::Dump);
     app.toast(format!("dumping {}…", conn.name), ToastKind::Info);
     let tx = ctx.tx.clone();
     let _ = tx.send(AppEvent::DumpStarted {
@@ -534,6 +617,52 @@ fn spawn_dump(ctx: &Ctx, app: &mut App, conn: Connection, root: std::path::PathB
             }
             Err(e) => {
                 let _ = tx.send(AppEvent::DumpFailed {
+                    conn_id: conn_clone.id.clone(),
+                    name: conn_clone.name.clone(),
+                    error: format!("{:#}", e),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_restore(ctx: &Ctx, app: &mut App, conn: Connection, path: std::path::PathBuf) {
+    if app.is_dumping(&conn.id) {
+        app.toast(
+            format!("{} is busy — wait for the current op to finish", conn.name),
+            ToastKind::Info,
+        );
+        return;
+    }
+    app.add_running(conn.id.clone(), conn.name.clone(), OpKind::Restore);
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dump")
+        .to_string();
+    app.toast(
+        format!("restoring {} ← {}…", conn.name, file_name),
+        ToastKind::Info,
+    );
+    let tx = ctx.tx.clone();
+    let _ = tx.send(AppEvent::RestoreStarted {
+        conn_id: conn.id.clone(),
+        name: conn.name.clone(),
+    });
+    let conn_clone = conn.clone();
+    let path_clone = path.clone();
+    tokio::spawn(async move {
+        match restore::restore(&conn_clone, &path_clone).await {
+            Ok(outcome) => {
+                let _ = tx.send(AppEvent::RestoreSucceeded {
+                    conn_id: conn_clone.id.clone(),
+                    name: conn_clone.name.clone(),
+                    outcome,
+                    path: path_clone,
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::RestoreFailed {
                     conn_id: conn_clone.id.clone(),
                     name: conn_clone.name.clone(),
                     error: format!("{:#}", e),
@@ -664,6 +793,27 @@ pub async fn apply_event(app: &mut App, ev: AppEvent, ctx: &Ctx) {
             app.finish_running(&conn_id);
             let short = error.lines().next().unwrap_or(&error).chars().take(120).collect::<String>();
             app.toast(format!("✗ {name}: {short}"), ToastKind::Error);
+        }
+        AppEvent::RestoreStarted { .. } => {}
+        AppEvent::RestoreSucceeded { conn_id, name, outcome, path } => {
+            app.finish_running(&conn_id);
+            let fname = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("dump");
+            app.toast(
+                format!(
+                    "✓ restored {name} from {fname} ({} in {})",
+                    crate::types::human_bytes(outcome.bytes_in),
+                    crate::types::human_duration(outcome.duration.as_secs())
+                ),
+                ToastKind::Success,
+            );
+        }
+        AppEvent::RestoreFailed { conn_id, name, error } => {
+            app.finish_running(&conn_id);
+            let short = error.lines().next().unwrap_or(&error).chars().take(140).collect::<String>();
+            app.toast(format!("✗ restore {name}: {short}"), ToastKind::Error);
         }
         AppEvent::TestResult { name, result } => match result {
             Ok(detail) => app.toast(

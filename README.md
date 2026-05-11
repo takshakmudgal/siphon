@@ -39,6 +39,7 @@ Then:
 | `n`            | new connection                                            |
 | `i`            | import an autodetected docker DB (credentials filled in)  |
 | `d` / `enter`  | dump now                                                  |
+| `R`            | restore a previously-saved dump back into the DB          |
 | `a`            | toggle / configure auto-backup                            |
 | `t`            | test connection                                           |
 | `e`            | edit                                                      |

@@ -4,6 +4,7 @@ pub mod config;
 pub mod detect;
 pub mod input;
 pub mod quirks;
+pub mod restore;
 pub mod schedule;
 pub mod types;
 pub mod ui;

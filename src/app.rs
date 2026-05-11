@@ -344,6 +344,19 @@ impl AutoForm {
 pub enum ConfirmKind {
     Delete { conn_id: String, name: String },
     Dump { conn_id: String, name: String },
+    Restore {
+        conn_id: String,
+        name: String,
+        path: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RestorePicker {
+    pub conn_id: String,
+    pub name: String,
+    pub files: Vec<crate::types::BackupFile>,
+    pub idx: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -367,13 +380,30 @@ pub enum Dialog {
     Auto(AutoForm),
     Confirm(ConfirmKind),
     BackupDir(BackupDirPrompt),
+    RestorePicker(RestorePicker),
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    Dump,
+    Restore,
+}
+
+impl OpKind {
+    pub fn verb(self) -> &'static str {
+        match self {
+            OpKind::Dump => "dumping",
+            OpKind::Restore => "restoring",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RunningDump {
     pub conn_id: String,
     pub name: String,
+    pub kind: OpKind,
     pub started: Instant,
 }
 
@@ -430,11 +460,12 @@ impl App {
         self.running.iter().any(|r| r.conn_id == conn_id)
     }
 
-    pub fn add_running(&mut self, conn_id: String, name: String) {
+    pub fn add_running(&mut self, conn_id: String, name: String, kind: OpKind) {
         if !self.is_dumping(&conn_id) {
             self.running.push(RunningDump {
                 conn_id,
                 name,
+                kind,
                 started: Instant::now(),
             });
         }
@@ -660,13 +691,13 @@ mod tests {
     fn running_dumps_track_per_connection() {
         let mut app = app_with(vec![pg_conn("1", "a"), pg_conn("2", "b")], vec![]);
         assert!(!app.is_dumping("1"));
-        app.add_running("1".into(), "a".into());
+        app.add_running("1".into(), "a".into(), OpKind::Dump);
         assert!(app.is_dumping("1"));
         assert!(!app.is_dumping("2"));
         // Idempotent: adding the same id again doesn't create a second slot.
-        app.add_running("1".into(), "a".into());
+        app.add_running("1".into(), "a".into(), OpKind::Dump);
         assert_eq!(app.running.len(), 1);
-        app.add_running("2".into(), "b".into());
+        app.add_running("2".into(), "b".into(), OpKind::Dump);
         assert_eq!(app.running.len(), 2);
         app.finish_running("1");
         assert!(!app.is_dumping("1"));
